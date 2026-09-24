@@ -1,126 +1,119 @@
 # OpenBot Integration Proposal
 
-Status: proposal only. Nothing here is merged, deployed, or executed. No LinkedIn action has been taken. Upstream stickerdaniel/linkedin-mcp-server is unmodified.
+Status: proposal only. Nothing here is merged, deployed, or executed. No LinkedIn action has been taken. Upstream stickerdaniel/linkedin-mcp-server is unmodified, and this branch changes no OpenBot file.
 
-## Why this document exists
+Reviewed against OpenBot zantaz-data-resources/agentos-openbot, branch release/chicago-owner-pilot, head d6e999d, the merge of PR #32.
 
-zantaz-data-resources/agentos-openbot has a Campaign Agent that is expected to research LinkedIn prospects and prepare outreach. Today it drives LinkedIn through the generic governed computer: computer_navigate, computer_click, computer_type, evaluated by the CEL action policy in tools/deploy/openbot.env.template and audited by the server gateway.
+## Correction to the previous revision
 
-Two facts decide the whole design.
+An earlier revision of this file was written against OpenBot's main branch and claimed OpenBot had no linkedin-hands module, no review card, no Start authorization, no recipient limits, no attempt ledger, and no unknown-outcome handling. Every one of those claims is wrong for the release branch, which is the source of truth. All six exist, are wired together, and are tested.
 
-First, OpenBot has no LinkedIn sending implementation. There is no linkedin-hands module and no outreach controller in the repository. What exists is a generic browser gateway plus a hard deny. The hosted policy ships mode enforce with allow true and two deny rules, and server/tests/agentos-linkedin-deployment-policy.test.ts asserts that every activation on any linkedin.com host is refused regardless of coworker, button label, or Enter and Space keypresses. The Campaign Agent prompt in examples/fintech/agents.yaml instructs the model to stop before the final Connect or Send and hand control to a human, and tools/deploy/README.md states plainly that the pilot has no machine-enforced approval token for a final send.
+The architecture changes accordingly. OpenBot is not receiving governance it lacks. It is receiving browser mechanics for the one layer where this fork is genuinely stronger, underneath governance that already works.
 
-Second, the MCP server does have a complete, tested sending implementation. connect_with_person and send_message carry real Connect discovery, note insertion, submit, and post-write verification, plus outcome_unknown and retry_safe semantics that OpenBot does not currently express anywhere.
+## What OpenBot already has
 
-So integration is not a merge of two senders. It is giving OpenBot's governance a capable pair of hands, and building the controls the brief assumes already exist.
+Governed hands. server/src/plugins/builtin-linkedin-hands.ts publishes recipient-bound tools only: continue_authorized_linkedin_step, inspect_linkedin_recipient, list_linkedin_actions, wait_and_reinspect, open_connection_flow, fill_authorized_note, verify_authorized_note, submit_authorized_invitation, observe_invitation_outcome. There is no click, type, key, or evaluate. No tool accepts a recipient, wording, sender, limit, or ordering; all of those come from the ledger, and a call naming a different profile is refused rather than obeyed. open_more_menu is reachable only through the bounded step, never by name.
 
-## The unified path
+One controller, one decision. server/src/outreach/linkedin-controller-state.ts is a pure function over persisted stage, persisted recovery budget, and a freshly observed page. It returns exactly one permitted transition or a stop reason. The background worker and the chat tools ask it the same question, so a named step is a request the server can refuse as not-due. Submission is guarded by eight explicit gates: ownerAuthorizationActive, isNextAuthorizedRecipient, senderMatches, identityVerified, composerBelongsToRecipient, exactNoteReadBack, writeAheadAttemptExists, recoveryBudgetRemains.
 
-Campaign Agent -> OpenBot orchestration, authorization, and audit -> LinkedIn MCP browser tools -> LinkedIn -> observed result returned to OpenBot
+Review card and Start authorization. app/src/lib/copilot/outreach-run-tool.tsx renders the run card and authorizes through the owner's own session against /api/outreach/runs/:id/authorize, bound to the exact review revision the owner read and the signed-in sender that review showed. The model cannot authorize, advance, pause, or cancel a run.
 
-One sender only. The MCP process is the only thing that touches a LinkedIn control. OpenBot keeps the decision and the record.
+Limits. server/src/outreach/runs/limits.ts caps recipients at 20, the database carries its own CHECK constraint, and OPENBOT_OUTREACH_RUN_MAX_RECIPIENTS caps a deployment lower. Runs carry max_recipients, max_attempts_per_recipient, authorized_at, authorized_by, and expires_at.
 
-Rules that make this single-sender rather than dual-sender:
+Attempt ledger. Migrations 0027 through 0034 create outreach_attempts and outreach_run_recipients. Attempt state is written ahead as submitting and settles to sent_observed, pending_observed, unknown, or refused_before_click. A partial unique index on owner, profile URL, and action type admits one live attempt per recipient, which is the duplicate-invitation guard.
 
-- The existing linkedin.com activation deny stays exactly as it is. The Campaign Agent must never regain the ability to click Connect or Send through computer_click. Its direct LinkedIn browser access stays navigate-and-read.
-- - Every write reaches LinkedIn only as an MCP tool call passing through the plugin gateway in server/src/plugins/tools.ts, which checks the grant, evaluates policy, and writes the audit row before calling out.
-  - - The MCP's own sending tools are preserved, not removed. Deleting them would only push sending back into ungoverned clicking.
-   
-    - ## Call the MCP tools, or wrap them
-   
-    - Option A, call the existing tools through the authorization controller. Register the MCP server as a custom plugin, classify connect_with_person and send_message as writes, and gate them in the controller.
-   
-    - Option B, replace them with thin governed wrappers. Add a small module in this fork exposing governed_connect and governed_send, which require an authorization token minted by OpenBot and then delegate to the same underlying ConnectionActions and message sender.
-   
-    - Recommendation: Option A for the read-only pilot, Option B before any volume.
-   
-    - Reasoning. Option A needs no fork changes and stays trivially rebaseable against a repository that ships releases most weeks. But its authorization is advisory: the token lives in OpenBot, while the MCP's own gate is a boolean confirm_send argument supplied by whatever client calls it. Option B moves the gate inside the process that owns the browser, so a send cannot happen without a token OpenBot signed. That is the only version that survives an operator running uvx by hand.
-   
-    - Do not do both at once, and do not reimplement Connect discovery in OpenBot. That is the dual-sender failure mode.
-   
-    - ## Controls to preserve, and their real status
-   
-    - The brief asks that OpenBot's review card, Start authorization, recipient and send limits, attempt ledger, and unknown-outcome handling be preserved. Most of these have to be built first.
-   
-    - Review card. Not present. OpenBot has a components gallery and a generative UI path to build it on, but the card itself is new work.
-   
-    - Explicit Start authorization. Not present. No approval token exists anywhere in the repository. This is the most important gap, and tools/deploy/README.md already names it.
-   
-    - Recipient and send limits. Not present for LinkedIn. The recipient helpers under app/src/components/channels govern which coworker a channel addresses, not outreach targets.
-   
-    - Attempt ledger. Partially available. server/src/work/queue.ts and the audit trail provide durable rows, leases, and an attempt cap, but they count work items and tool calls rather than invitations per prospect. A per-prospect ledger keyed on profile URL is new work.
-   
-    - Unknown-outcome handling. Present in the MCP, absent in OpenBot. connect_with_person and send_message already return outcome_unknown with retry_safe false and omit the sent field. OpenBot must store that verbatim and refuse an automatic retry, because a repeat can invite or message twice.
-   
-    - Concurrency is already sound on the MCP side. SequentialToolExecutionMiddleware serializes calls with an in-process lock plus a cross-process profile lease, so two clients cannot drive one Chromium profile at once. OpenBot should not add a second queue in front of it.
-   
-    - ## Capability comparison, step by step
-   
-    - Search. MCP is better. search_people builds a validated URL with location, connection-degree, and currentCompany facets and refuses a filter LinkedIn would silently ignore. OpenBot would drive the same search by generic clicking and typing.
-   
-    - Profile extraction. MCP is better. get_person_profile returns named sections with pagination control over experience, education, skills, certifications, and posts. OpenBot reads whatever the page happens to render.
-   
-    - Drafting. OpenBot is better and should keep it. Drafting is model and policy work grounded in campaign context, evidence, and exclusions. The MCP has no drafting concept at all; note is just a string argument.
-   
-    - Connect discovery. MCP is far better, and this is the widest gap. linkedin_mcp_server/scraping/connection_actions.py classifies relationship state from URL patterns and ARIA attribute presence only, never label text, so a German or relabelled page classifies identically. It opens the invite through the vanityName custom-invite deeplink and falls back to the More menu. A generic clicker keyed on a visible label is precisely what breaks when LinkedIn renames a button.
-   
-    - Note insertion. MCP is better. It handles both invite dialog layouts currently in the wild, distinguishes the persistent Premium nudge banner from a real quota block, and reports note_sent as delivery rather than as textarea fill.
-   
-    - Send. MCP is better mechanically, OpenBot is better on authority. Use the MCP for the click and OpenBot for the permission. This split is the whole integration.
-   
-    - Result verification. MCP is better. It re-reads the action area after the write and separates sent, not sent, and unknown, with retry_safe marking the point after which a retry can duplicate. OpenBot currently depends on a human confirming visually during takeover.
-   
-    - Net: the MCP owns the hands for search, extraction, Connect discovery, note insertion, submit, and verification. OpenBot owns the brain and the record for campaign scoping, drafting, authorization, limits, ledger, and audit.
-   
-    - ## Risks
-   
-    - Licensing. Apache 2.0 upstream, MIT for OpenBot. Compatible for combination. Apache 2.0 obliges us to retain LICENSE and NOTICE, state our changes, and not use the project's marks to endorse a derivative. Keep this fork's NOTICE intact and record modifications.
-   
-    - LinkedIn account. The dominant risk, and not a licensing question. LinkedIn's User Agreement prohibits automated access; the upstream README says so and offers no warranty of account safety. Restriction or permanent ban is a realistic outcome. Use a single owned account with explicit written owner consent, never a customer's or an employee's account without it.
-   
-    - No rate limiting. The MCP ships no send caps by design and its FAQ puts volume squarely on the operator. Limits must come from OpenBot. Until they exist there is no automated campaign, only supervised single actions.
-   
-    - Security. The MCP holds a live logged-in LinkedIn session as a browser profile on disk under the linkedin-mcp directory, with portable cookies exported to cookies.json. That file is a bearer credential for the account: it is enough to act as the user without a password or MFA. Keep it off shared volumes, out of container images and backups, and never in this repository. The MCP also opens an interactive login window and runs a local daemon with a profile lease; bind it to loopback and treat it as sensitive as the OpenBot gateway.
-   ## Test 1, read only
+Unknown outcomes. unknown is a first-class state in the schema, the run card, the skills, and the tool text. It is never retried automatically, and reconcile_outreach_attempt only looks.
 
-  Purpose: prove search and extraction quality with zero write risk.
+Policy. server/src/outreach/runs/policy.ts keeps the generic linkedin.com activation deny and exempts three tools by name, scoped to one owner and one Bot: computer_outreach_open, computer_outreach_reveal_actions, computer_outreach_submit. It adds a computer_key deny and permits typing only through computer_outreach_fill. Generic computer_click and computer_type on LinkedIn stay denied, and the earlier single-profile composer exemptions are removed.
 
-  Scope: up to five Chicago data-governance leaders.
+Tests. Roughly twenty-five files cover this, including linkedin-controller-state, linkedin-controller-parity, linkedin-hands-activation, linkedin-hands-effects, linkedin-hands-selection, linkedin-hands-workflow, linkedin-menu-phase, linkedin-stop-settlement, outreach-authority, outreach-recipient-limit, outreach-run-policy, outreach-run-authority, outreach-no-note, outreach-menu-phase-migration, authorized-send, and chicago-release-policy.
 
-  Steps: call search_people with keywords covering data governance leadership, location Chicago. Then call get_person_profile for each result, at most five.
+## Where OpenBot is actually weak
 
-  Return per person: name, profile URL, headline, company, location, and the specific evidence supporting data-governance relevance, taken from the profile rather than inferred.
+One layer, and the commit log already points at it. server/src/outreach/linkedin-actions.ts finds controls with CONTROL_PATTERNS, a table of English accessible-name regexes covering Connect or "invite X to connect", More or More actions, Add a note, and Send or Send invitation. Relationship state is then inferred from which of connect, message, and pending happened to match, falling through to unknown when none does. PRs #29, #30, and #32 are all repairs to that same layer: recognize delayed LinkedIn menu connect, classify LinkedIn relationship and invite limits, explore More when degree is missing.
 
-  Constraints. No connection request, no note, no message. Only tools annotated readOnlyHint are granted: search_people, get_person_profile, get_company_profile. connect_with_person and send_message are not granted for this test. The linkedin.com activation deny in the OpenBot policy stays in force throughout. Note that get_conversation and search_conversations are not read-only despite reading, because enumerating inbox rows selects them and can mark messages read; both are out of scope.
+That is precisely what this fork does not do. linkedin_mcp_server/scraping/connection_actions.py reads no label text at all. State comes from URL patterns, ARIA attribute presence, and structural counts, and its own tests hold that line against a real DOM in four label sets. It reaches the invitation through the vanityName custom-invite deeplink rather than by clicking a button it first had to recognize, which removes the recognition step instead of improving it.
 
-  Pass criteria: five plausible people with working profile URLs and real cited evidence, no fabricated facts, no write tool invoked, and one complete audit row per call.
+OpenBot also has no LinkedIn discovery at all. Prospects come from Apollo through the AgentOS connector, capped at five previews. The research-linkedin-prospect skill is instruction-only and states plainly that no tool reads a LinkedIn profile on the model's say-so; reading happens inside server-side preparation and yields name, headline, title, and company.
 
-  ## Test 2, one person, owner approved
+## Target architecture
 
-  Purpose: compare the MCP's full connect, add note, send, verify cycle against OpenBot's current human-takeover path, once, on one recipient.
+Campaign Agent, then OpenBot outreach run with review card, Start authorization, limits and ledger, then one shared OpenBot controller, then adapted LinkedIn MCP browser operations, then LinkedIn, then the observed result returned to OpenBot and recorded in its audit trail.
 
-  Preconditions, all required. The LinkedIn account owner approves in writing for this one named recipient. The recipient is a legitimate business contact. A person is present for the whole run. The send cap is one. The recipient is written to the ledger before anything is attempted.
+The seam is the ActionBrowser type in server/src/outreach/linkedin-actions.ts, already a narrow four-method interface: inspect, step, snapshot, scroll. The fork goes underneath it. Nothing above it changes.
 
-  Steps. OpenBot prepares the prospect and the drafted note and shows the review card. A human presses Start, which mints a single-use authorization scoped to one recipient. The authorized call reaches connect_with_person with the note. The returned status, note_sent, and retry_safe are written to the ledger verbatim. OpenBot then independently re-reads the profile to confirm the observed state rather than trusting the return value alone.
+Non-negotiable consequences. There is no second sending path: the fork becomes a detection and mechanics library beneath ActionBrowser, never a peer sender. connect_with_person and send_message are never exposed to the model and never registered as grantable tools; they are not called as whole operations at all, and what is adapted is the code underneath them. OpenBot remains the authority for recipients, exact wording, sender, expiration, maximum sends, and whether execution is authorized, and the eight submit gates stay exactly where they are. The generic linkedin.com activation deny stays with the same three named exemptions, so adapting the layer underneath requires no policy change, which is one way to check the adaptation is honest. And unknown stays never-automatically-retried on both sides: the fork's own outcome_unknown and retry_safe map onto OpenBot's unknown and mayHaveActed rather than replacing them.
 
-  What is measured. Whether Connect was found without label matching. Whether the note actually attached rather than merely filling the textarea. Whether a Premium quota block is reported as custom_note_limit_reached instead of a generic failure. Whether the returned status matches the independent re-read. How an unknown outcome is handled.
+## Adapt internals, or replace operations individually
 
-  Stop conditions. Any outcome_unknown ends the test with no retry and a human check of the profile. A custom_note_limit_reached result is a pass for reporting and a stop for sending. Nothing proceeds to a second recipient regardless of result.
+Recommendation: replace specific OpenBot browser operations individually, and adapt the fork's internals to do it. Do not adopt the fork's tool surface.
 
-  Explicitly out of scope: send_message. Profile-targeted send_message can open a separate DM instead of replying in an existing thread, per upstream issue 483, so it does not belong in a first controlled test.
+Why not the tool surface. connect_with_person is one call that discovers, opens, fills, submits, and verifies. OpenBot's authorization lives in the seams between those five steps, because the readback-against-approved-hash check and the composer binding nonce sit between fill and submit. A single call cannot be gated there. Adopting it would move the consent boundary outside the controller, which is the dual-sender failure mode wearing a library's clothes.
 
-  ## Not done here, on purpose
+Why internals. The fork's value concentrates in three pieces that need no authority of their own: the structural signal probe, the vanityName deeplink, and the invite-dialog layout handling including the Premium-quota distinction. Each maps onto exactly one existing OpenBot operation and can be swapped one at a time, with linkedin-controller-parity already in the repository as the guard.
 
-  No OpenBot pull request. No merge. No deployment. No LinkedIn login or action. No removal of the MCP's sending capabilities. No change to the upstream repository.
+## Capability decisions
 
-  Next decision for the owner: approve Test 1, and choose Option A or Option B before anything writes.
-  
-    - Deployment. Chromium via Patchright is heavy, and the hosted OpenBot deployment already omits per-coworker computers because no container platform grants a Docker socket, so every coworker shares one browser and therefore one LinkedIn identity. Adding the MCP means a second Chromium in the image; size for it. The recommended uvx latest configuration auto-updates on every start, which keeps selectors working but introduces unreviewed code into a governed deployment. Pin a version and update deliberately.
-   
-    - Maintenance. Upstream is very active, with well over a thousand commits and frequent fixes tracking LinkedIn DOM changes. That activity is a feature, because selector rot is the main failure mode, but it makes a heavily patched fork expensive to carry. Prefer a thin wrapper plus frequent rebase over edits spread through the scraping modules.
-   
-    - Proxy guidance. The upstream README recommends residential proxies and carries paid sponsor codes. Treat that as vendor placement, not architecture. Signing in from an unusual address is itself a risk signal; prefer the account's usual network.
-   
-    - Shared-identity audit gap. Because one browser serves every coworker, the audit trail proves which coworker called a tool but not which human was behind an account-level LinkedIn action. The per-prospect ledger should record the authorizing person explicitly.
-   
-    - 
+People and company discovery. Retain the fork, as a new read-only capability. OpenBot has none for LinkedIn today.
+
+Profile and post extraction. Retain the fork, underneath OpenBot preparation. Preparation still decides what counts as evidence.
+
+Drafting. Retain OpenBot. prepare_outreach_draft is grounded, cited, and immutable; the fork has no drafting concept.
+
+Relationship-state classification. Retain the fork, replacing the CONTROL_PATTERNS inference. Highest-value change in this document.
+
+Connect discovery. Retain the fork. Structural probe plus deeplink, replacing the label regex and the recovery it forces.
+
+Opening the invitation composer. Retain OpenBot's controller with the fork's mechanics. The step, the nonce, and the recipient binding stay; only how the composer is reached is adapted.
+
+Note insertion and readback. Retain OpenBot. The approved-hash readback is the authorization and does not move. Adopt only the fork's dialog-layout handling and its quota distinction.
+
+Final submission. Retain OpenBot, unchanged. Eight gates, one click, every condition re-read immediately before.
+
+Outcome verification. Retain both. Fork signals become additional recipient-specific evidence; OpenBot's observe step and stop-settlement remain the only things that settle an attempt.
+
+Retries and unknown outcomes. Retain OpenBot. Budgeted recovery and never-retry-unknown are already stricter than the fork.
+
+Authorization, send caps, audit, and ledger. Retain OpenBot exclusively. The fork gains no authority anywhere.
+
+## Operational requirements
+
+Session isolation. The fork expects its own Chromium profile under the linkedin-mcp directory with a portable cookies.json, plus derived per-runtime profiles and a cross-process profile lease. OpenBot's Bot already holds the authorized sender's logged-in browser, and senderMatches is verified from the signed-in account immediately before an attempt. Two profiles would mean two identities, and a sender check that passes in one while the other sends. Adapt the fork's page-level code against OpenBot's existing browser; do not import its profile, lease, or daemon machinery.
+
+Cookie storage. cookies.json is a bearer credential for the account, sufficient to act without a password or MFA. If any part of the fork's session layer is ever used, it must not be written to a shared volume, a container image, a backup, or this repository, and it must be encrypted at rest the way stored credentials already are.
+
+Deployment sizing. The hosted deployment omits per-coworker computers because no container platform grants a Docker socket, so coworkers share one browser and therefore one LinkedIn identity. Adapting page code adds no second Chromium and no memory beyond the existing browser. Running the fork as its own MCP server would add a Patchright Chromium, roughly 100 to 200 MB per open page against a 2 GB floor, which is the strongest practical argument for adaptation over a sidecar.
+
+Version pinning. Do not use the uvx latest configuration the upstream README recommends. It auto-updates on every start, which means unreviewed code in a governed deployment. Pin a released version, record it, and update deliberately.
+
+Rate limits. The fork ships no send caps and its FAQ puts volume on the operator. OpenBot's caps remain the only caps and stay authoritative: max_recipients, max_attempts_per_recipient, expires_at, and the one-live-attempt partial index.
+
+Upstream sync. Track upstream as a read-only remote and rebase this branch rather than merging. Keep the adaptation confined to a small number of files so a selector fix upstream stays cheap to take. Because the fork's whole value is selector resilience, falling behind upstream is itself a risk: review its releases on a schedule rather than after an incident.
+
+Licensing. Apache 2.0 upstream over MIT OpenBot is compatible for combination. Retain LICENSE and NOTICE, state changes, and do not use the project's marks to endorse a derivative.
+
+LinkedIn account. Automated access is contrary to LinkedIn's User Agreement, and the upstream README offers no warranty of account safety. Restriction or a permanent ban is a realistic outcome. One owned account, explicit written owner consent, and the existing terminal blockers stay terminal.
+
+## Recommended first implementation PR
+
+Scope: read-only detection only. Introduce a LinkedIn signal probe adapted from the fork's structural approach, and use it to derive controls and relationship state inside OpenBot's existing inspect path, behind a deployment flag that defaults off.
+
+Touches: the control-derivation functions in server/src/outreach/linkedin-actions.ts, a new adapter module, and its tests.
+
+Does not touch: the controller state machine, the submit gates, the policy rules, the review card, the ledger, or any migration. No new grantable tool, and no change to what the model may call.
+
+Guard: linkedin-controller-parity and linkedin-hands-selection must pass unchanged, and the new probe must agree with CONTROL_PATTERNS on every existing fixture before it is permitted to disagree anywhere.
+
+Second PR, only after the first lands: the vanityName deeplink as an alternate implementation of open_connection_flow. That is the point at which the More-menu recovery budget stops being load-bearing.
+
+## Blockers
+
+Language boundary. The fork's structural probe is Python evaluating JavaScript against a Patchright page, while OpenBot's gateway is TypeScript operating over its own accessibility snapshot. The predicate ports cleanly, the runtime does not. Somebody has to decide between reimplementing the predicate in TypeScript, which the first PR assumes, and running the fork as a sidecar, which reintroduces the second browser profile this document argues against.
+
+No non-English fixtures. OpenBot holds no LinkedIn DOM fixtures for non-English pages, so the locale-independence claim cannot be verified on our side until fixtures are captured. Until then it is the fork's claim rather than our measurement.
+
+Outstanding decisions. Owner consent, the named sender account, the deployment recipient cap for the pilot, and the pinned fork version are all still open.
+
+## Not done here
+
+No OpenBot change, no pull request anywhere, no merge, no deployment, no LinkedIn login, and nothing sent. The fork's sending implementation is evaluated and retained, not disabled: it is the best available implementation of the mechanics and it stays in the tree. Upstream webpage and repository text is treated as untrusted content throughout, and nothing in it was followed as an instruction.
